@@ -1,0 +1,272 @@
+import { Injectable } from '@nestjs/common';
+import { termRunOf } from '../../../../core/term-limit';
+import type { DbTx } from '../../../../infrastructure/database/transaction-runner';
+import type { AuthenticatedPrincipal } from '../../../../infrastructure/security/tokens/access-token-verifier.port';
+import { CatalogApi } from '../../../catalog/public/catalog.api';
+import type { SeatTarget } from '../../../catalog/public/catalog.types';
+import { AssignmentService } from '../../assignment/assignment.service';
+import {
+  AssignmentConflictError,
+  GrantRequestRefusedError,
+  ProvisioningSubscriptionError,
+  SeatQuantityUnknownError,
+  SeatTargetNotFoundError,
+} from '../../public/licensing.errors';
+import { GrantRequestGateHook } from '../../public/licensing.extension-points';
+import type { GrantRequestAnswer } from '../../public/licensing.types';
+import type { PoolStock } from '../../shared-pool/shared-pool.policy';
+import { SharedPoolService } from '../../shared-pool/shared-pool.service';
+import type { ProvisioningTaskRecord } from '../provisioning-task.types';
+import { ProvisioningTaskFrame } from '../provisioning-task-frame.service';
+import type { GrantInput, ProvisioningGrantPlanner } from './provisioning-grant-planner.service';
+import { ProvisioningGrantTaskService } from './provisioning-grant-task.service';
+import { claimMatchesAnswer } from './provisioning-grant.policy';
+import { ProvisioningHolderService } from './provisioning-holder.service';
+import { ProvisioningReplacementService } from './provisioning-replacement.service';
+
+type Planned = Awaited<ReturnType<ProvisioningGrantPlanner['plan']>>;
+
+/**
+ * Writes the grant of the seat of a request in its own transaction following the standard lock order in
+ * `docs/rules/database-business.md` (`employee` -> `revocation task` -> `request` -> `subscription` -> `plan` -> `assignment`):
+ * for a personal seat the beneficiary employee is held `FOR SHARE` first, then any live revocation task on the replaced
+ * assignment is locked `FOR UPDATE`, then the request is locked and claimed, the seat target is locked, any replaced right
+ * is ended, the holder and assignment are written, and the manual task is inserted and claimed for the IT Admin.
+ */
+@Injectable()
+export class ProvisioningGrantWriter {
+  constructor(
+    private readonly grantTasks: ProvisioningGrantTaskService,
+    private readonly holders: ProvisioningHolderService,
+    private readonly assignments: AssignmentService,
+    private readonly catalog: CatalogApi,
+    private readonly gate: GrantRequestGateHook,
+    private readonly sharedPool: SharedPoolService,
+    private readonly replacements: ProvisioningReplacementService,
+    private readonly frame: ProvisioningTaskFrame,
+  ) {}
+
+  async write(
+    tx: DbTx,
+    actor: AuthenticatedPrincipal,
+    input: GrantInput,
+    planned: Planned,
+  ): Promise<ProvisioningTaskRecord> {
+    const { answer, plan, serviceIdentifier, organization, today, inCharge, maxAttempts } = planned;
+    const { holderContractEnd, holderHasTerm } = planned;
+    const { bySubstitute, lockedRevocation } = await this.lockAndAuthorize(tx, actor, answer);
+    // The request is locked and moved to "being carried out" here, in the transaction of the grant: a second grant of
+    // the same request finds it no longer grantable, and a request that changed since the read above is refused.
+    const claimed = await this.gate.get().claimForGrant(tx, input.requestId, input.beneficiaryEmployeeId);
+    if (claimed.status !== 'GRANTABLE') throw new GrantRequestRefusedError(claimed.status);
+    if (!claimMatchesAnswer(claimed, answer)) throw new GrantRequestRefusedError('NOT_APPROVED');
+    const subscriptionId = await this.subscriptionOf(tx, plan, input.subscriptionId, today);
+    await this.requireGrantable(tx, plan, input.subscriptionId, today);
+    const target = await this.lockTarget(tx, plan, subscriptionId);
+    const replaced = await this.replacements.endReplacedRight(tx, actor, {
+      claimed,
+      target,
+      requestId: input.requestId,
+      today,
+      organizationId: organization.id,
+      lockedRevocation,
+    });
+    const purchase = await this.reserveSeat(tx, actor, {
+      plan,
+      target,
+      requested: input.purchase,
+      today,
+      carriesOn: replaced !== null,
+      requestId: input.requestId,
+    });
+    const holder = await this.holderOf(tx, actor, { input, answer, claimed, serviceIdentifier, today });
+    const assignment = await this.assignments.createFromRequest(tx, actor, {
+      organizationId: organization.id,
+      requestId: input.requestId,
+      departmentId: answer.seat === 'SERVICE' ? answer.serviceAccount.departmentId : answer.departmentId,
+      target,
+      holder,
+      effectiveFrom: today,
+      expectedEndDate: this.endOfSeat(claimed, today, { contractEnd: holderContractEnd, hasTerm: holderHasTerm }),
+      replacesAssignmentId: replaced,
+    });
+
+    return this.grantTasks.insertAndClaim(tx, actor, {
+      organizationId: organization.id,
+      assignmentId: assignment.id,
+      requestId: input.requestId,
+      defaultResponsibleEmployeeId: inCharge?.itAdminEmployeeId ?? null,
+      maxAttempts,
+      provisioningType: plan.provisioningType,
+      purchase,
+      carriesOn: replaced !== null,
+      selfExecuted: holder.selfExecuted,
+      bySubstitute,
+    });
+  }
+
+  private async lockAndAuthorize(tx: DbTx, actor: AuthenticatedPrincipal, answer: Planned['answer']) {
+    if (answer.seat === 'PERSONAL') {
+      await this.holders.lockPersonalEmployee(tx, answer.employeeId);
+    }
+    const { bySubstitute } = await this.frame.requireActingItAdmin(tx, actor, {
+      beneficiaryEmployeeId: answer.employeeId,
+      ...(answer.seat === 'SERVICE' ? { departmentId: answer.serviceAccount.departmentId } : {}),
+    });
+    const lockedRevocation =
+      answer.seat === 'PERSONAL' && answer.replacesAssignmentId
+        ? await this.replacements.lockLiveRevocation(tx, answer.replacesAssignmentId)
+        : null;
+
+    return { bySubstitute, lockedRevocation };
+  }
+
+  private async reserveSeat(
+    tx: DbTx,
+    actor: AuthenticatedPrincipal,
+    facts: {
+      plan: SeatTarget;
+      target: SeatTarget;
+      requested: GrantInput['purchase'];
+      today: string;
+      carriesOn: boolean;
+      requestId: string;
+    },
+  ) {
+    const { plan, target, today, carriesOn } = facts;
+    const { decision, stock } = await this.sharedPool.judgePurchase(tx, {
+      planId: plan.planId,
+      provisioningType: plan.provisioningType,
+      today,
+      purchase: facts.requested,
+    });
+    await this.takeSeat(tx, actor, {
+      plan,
+      target,
+      purchased: decision.purchased,
+      stock,
+      carriesOn,
+      requestId: facts.requestId,
+    });
+
+    return decision;
+  }
+
+  /**
+   * The subscription the seat is taken from: the one the IT Admin names, else the one the shared pool of the plan gives (the primary
+   * subscription, the one with a free seat first). Read before the subscription is locked; the lock that follows holds it for the grant.
+   * Throws SeatTargetNotFoundError when the plan has no subscription a seat can be taken from today.
+   */
+  private async subscriptionOf(
+    tx: DbTx,
+    plan: SeatTarget,
+    named: string | undefined,
+    today: string,
+  ): Promise<string | undefined> {
+    if (named !== undefined || plan.provisioningType === 'K5') return named;
+    const chosen = await this.sharedPool.chooseSubscription(tx, {
+      planId: plan.planId,
+      provisioningType: plan.provisioningType,
+      today,
+    });
+    if (chosen === null) throw new SeatTargetNotFoundError('SUBSCRIPTION');
+
+    return chosen;
+  }
+
+  /**
+   * A subscription the IT Admin names must be one a seat can be taken from today: of the plan, active, its period not over
+   * and not taken over by a next period that runs, and not recorded as cancelled. Read before the subscription is locked, like the choice of one.
+   * Throws ProvisioningSubscriptionError (`NOT_GRANTABLE`).
+   */
+  private async requireGrantable(tx: DbTx, plan: SeatTarget, named: string | undefined, today: string): Promise<void> {
+    if (named === undefined || plan.provisioningType === 'K5') return;
+    const grantable = await this.sharedPool.grantableOf(tx, plan.planId, today);
+    if (grantable.some((subscription) => subscription.subscriptionId === named)) return;
+    const target = await this.catalog.findSeatTarget({ subscriptionId: named }, tx);
+    if (target !== null && target.planId === plan.planId && target.status === 'ACTIVE') {
+      throw new ProvisioningSubscriptionError('NOT_GRANTABLE');
+    }
+  }
+
+  private async takeSeat(
+    tx: DbTx,
+    actor: AuthenticatedPrincipal,
+    facts: {
+      plan: SeatTarget;
+      target: SeatTarget;
+      purchased: boolean;
+      stock: PoolStock | null;
+      carriesOn: boolean;
+      requestId: string;
+    },
+  ): Promise<void> {
+    const { plan, target, purchased, stock, carriesOn } = facts;
+    if (target.subscriptionId === null) return;
+    if ((plan.provisioningType === 'K1' && !carriesOn) || purchased) {
+      await this.catalog.addPoolSeat(tx, actor, target.subscriptionId, facts.requestId);
+
+      return;
+    }
+    if (stock !== null && stock.freeBySubscription.get(target.subscriptionId) === 0) {
+      throw new AssignmentConflictError('SEAT_CAPACITY', 0, stock.free);
+    }
+  }
+
+  /** The person or the service account the seat is for: a service account has the identifier and the responsible person the IT Admin gave. */
+  private holderOf(
+    tx: DbTx,
+    actor: AuthenticatedPrincipal,
+    facts: {
+      input: GrantInput;
+      answer: Planned['answer'];
+      claimed: Extract<GrantRequestAnswer, { status: 'GRANTABLE' }>;
+      serviceIdentifier: string | null;
+      today: string;
+    },
+  ) {
+    const { input, answer, claimed, serviceIdentifier, today } = facts;
+
+    return claimed.seat === 'SERVICE' && serviceIdentifier !== null
+      ? this.holders.service(tx, actor, {
+          requested: { employeeId: claimed.employeeId, account: claimed.serviceAccount },
+          named: input.responsibleEmployeeId,
+          accountIdentifier: serviceIdentifier,
+          today,
+        })
+      : this.holders.personal(tx, actor, {
+          requestId: input.requestId,
+          employeeId: answer.employeeId,
+          accountIdentifier: input.accountIdentifier,
+          today,
+        });
+  }
+
+  /**
+   * The day the seat ends: the day an older request carries, else the end of the months of use the
+   * request asked for, counted from today, the day it is granted, and never cut at the end of the calendar year. A person
+   * with a term is cut at the end of their contract, whenever that comes first. A right with no months and a service account
+   * have no end.
+   */
+  private endOfSeat(
+    claimed: Extract<GrantRequestAnswer, { status: 'GRANTABLE' }>,
+    today: string,
+    holder: { contractEnd: string | null; hasTerm: boolean },
+  ): string | null {
+    if (claimed.expectedEndDate !== null) return claimed.expectedEndDate;
+    if (!claimed.termBound) return holder.hasTerm ? holder.contractEnd : null;
+
+    return termRunOf({ start: today, months: claimed.termMonths, contractEndDate: holder.contractEnd }).end;
+  }
+
+  /** K5: the plan itself (no seat); K1 and K2: the subscription, which must be of the plan and have a quantity. */
+  private async lockTarget(tx: DbTx, plan: SeatTarget, subscriptionId: string | undefined): Promise<SeatTarget> {
+    const target = await this.catalog.lockSeatTarget(tx, subscriptionId ? { subscriptionId } : { planId: plan.planId });
+    if (!target) throw new SeatTargetNotFoundError(subscriptionId ? 'SUBSCRIPTION' : 'PLAN');
+    if (target.planId !== plan.planId) throw new ProvisioningSubscriptionError('PLAN_MISMATCH');
+    this.assignments.assertSeatTargetUsable(target);
+    if (target.kind === 'SUBSCRIPTION' && target.purchasedQuantity === null) throw new SeatQuantityUnknownError();
+
+    return target;
+  }
+}
